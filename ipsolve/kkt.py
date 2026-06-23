@@ -85,7 +85,8 @@ class SchurOperator:
     """
 
     def __init__(self, B_meas, T_solve_m, B_proc=None, T_solve_p=None,
-                 WR=None, A=None, delta=0.0):
+                 WR=None, A=None, delta=0.0,
+                 T_m=None, T_p=None):
         self.B_meas = B_meas
         self.T_solve_m = T_solve_m
         self.B_proc = B_proc
@@ -93,7 +94,46 @@ class SchurOperator:
         self.WR = WR
         self.A = A
         self.delta = delta
+        # T blocks (sparse matrices) let to_dense() assemble Omega without
+        # densifying when they are diagonal; the dense fallback only needs the
+        # solve callables above.
+        self.T_m = T_m
+        self.T_p = T_p
+        self.assembly = None  # records which path to_dense() last took
         self.n = B_meas.shape[1]
+
+    @staticmethod
+    def _is_diagonal(M):
+        """True iff sparse M is diagonal (cheap: short-circuits when nnz > n)."""
+        if not sp.issparse(M) or M.nnz > M.shape[0]:
+            return False
+        return (M - sp.diags(M.diagonal())).nnz == 0
+
+    # Below this fill fraction a model matrix counts as "genuinely sparse".
+    SPARSE_DENSITY = 0.1
+
+    def _block_ok(self, B, T):
+        """A block takes the sparse path iff B is genuinely sparse and T is
+        diagonal -- then T^{-1} B is a row scaling that keeps B sparse."""
+        if not sp.issparse(B) or T is None:
+            return False
+        density = B.nnz / (B.shape[0] * B.shape[1])
+        return density <= self.SPARSE_DENSITY and self._is_diagonal(T)
+
+    def _use_sparse(self):
+        """Take the sparse assembly only when it is unambiguously cheaper.
+
+        That happens when each B is genuinely sparse and its T block is
+        *diagonal* -- the usual separable-loss + structured-model case (e.g. a
+        Kalman smoother).  Then Omega = B' T^{-1} B is assembled banded with no
+        dense intermediate.  For dense / coupled models (dense B or non-diagonal
+        T, e.g. a dense Lasso) we keep the original dense path, which is faster
+        there than sparse bookkeeping."""
+        if not self._block_ok(self.B_meas, self.T_m):
+            return False
+        if self.B_proc is not None and not self._block_ok(self.B_proc, self.T_p):
+            return False
+        return True
 
     # -- mat-vec (for CG) ------------------------------------------------
     def matvec(self, x):
@@ -110,13 +150,36 @@ class SchurOperator:
         """Return a scipy LinearOperator for CG."""
         return spla.LinearOperator((self.n, self.n), matvec=self.matvec)
 
-    # -- dense (for direct solve) ----------------------------------------
+    # -- assemble Omega (for direct solve) -------------------------------
     def to_dense(self):
-        """Materialise Omega as a dense/sparse matrix."""
-        Omega = self.B_meas.T @ self.T_solve_m(self.B_meas.toarray())
-        if self.B_proc is not None:
-            Omega += self.B_proc.T @ self.T_solve_p(self.B_proc.toarray())
-        Omega = sp.csc_matrix(Omega)
+        """Materialise Omega = B' T^{-1} B (+ constraint/reg terms).
+
+        Tracks the model's sparsity and picks the cheaper assembly:
+
+        * **sparse** -- ``T^{-1} B`` via ``spsolve`` with a sparse RHS, so
+          the intermediate and the resulting ``Omega`` stay sparse/banded.
+          Used when ``B_meas`` is genuinely sparse (e.g. a Kalman smoother),
+          where the dense ``B_meas.toarray()`` + ``O(n^2 m)`` matmul dominate.
+        * **dense** -- the original path (apply the factor to a dense RHS).
+          Used when the model is near-dense, where sparse bookkeeping only
+          adds overhead.
+        """
+        if self._use_sparse():
+            self.assembly = "sparse"
+            # Diagonal T => T^{-1} B is a row scaling; Omega stays banded.
+            Bm = sp.csc_matrix(self.B_meas)
+            Tinv_B = sp.diags(1.0 / self.T_m.diagonal()) @ Bm
+            Omega = (Bm.T @ Tinv_B).tocsc()
+            if self.B_proc is not None:
+                Bp = sp.csc_matrix(self.B_proc)
+                Tinv_Bp = sp.diags(1.0 / self.T_p.diagonal()) @ Bp
+                Omega = Omega + (Bp.T @ Tinv_Bp).tocsc()
+        else:
+            self.assembly = "dense"
+            Omega = self.B_meas.T @ self.T_solve_m(self.B_meas.toarray())
+            if self.B_proc is not None:
+                Omega += self.B_proc.T @ self.T_solve_p(self.B_proc.toarray())
+            Omega = sp.csc_matrix(Omega)
         if self.WR is not None:
             Omega = Omega + self.A @ self.WR @ self.A.T
         if self.delta > 0:
@@ -311,15 +374,20 @@ def kkt_solve(
     # -- T = MM + C QD C' --
     T = sp.csc_matrix(MM + C @ QD @ C.T)
 
-    # Factor T (full or blocks)
+    # Factor T (full or blocks).  Keep the sparse T blocks too, so the Schur
+    # assembly can form Omega without densifying (see SchurOperator.to_dense).
     if has_proc:
-        T_solve_m = _sparse_factor(T[:m, :m])
-        T_solve_p = _sparse_factor(T[m:, m:])
+        T_m = sp.csc_matrix(T[:m, :m])
+        T_p = sp.csc_matrix(T[m:, m:])
+        T_solve_m = _sparse_factor(T_m)
+        T_solve_p = _sparse_factor(T_p)
         T_solve = _sparse_factor(T)           # for back-substitution
     else:
         T_solve = _sparse_factor(T)
         T_solve_m = T_solve
         T_solve_p = None
+        T_m = T
+        T_p = None
 
     # -- RHS construction --
     rhs1 = -d * q + mu
@@ -350,6 +418,7 @@ def kkt_solve(
         B_meas, T_solve_m,
         B_proc=B_proc, T_solve_p=T_solve_p,
         WR=WR, A=A, delta=delta,
+        T_m=T_m, T_p=T_p,
     )
     dy, cg_iters = _solve_schur(omega, rhs5, inexact, pcg_tol)
 
