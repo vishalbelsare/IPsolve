@@ -146,12 +146,15 @@ def ip_solve(
         print("=" * 80)
 
     converged = False
+    G0 = None          # initial KKT-residual magnitude (relative-test reference)
     total_cg = 0
     for itr in range(max_iter):
         # -- KKT residual --
         F = kkt_residual(lin_term, b, B_meas, c, C, M,
                          q, u, r, w, y, mu, **kkt_kw)
         G = np.max(np.abs(F))
+        if G0 is None:
+            G0 = max(G, 1.0)
 
         # -- Newton direction --
         sol = kkt_solve(lin_term, b, B_meas, c, C, M,
@@ -223,8 +226,16 @@ def ip_solve(
             n_slacks += 2 * len(r)
         mu = 0.1 * G1 / n_slacks
 
-        # -- Convergence --
-        converged = (G1 < opt_tol) or (G_new < opt_tol)
+        # -- Convergence (scale-free) --
+        # Test the *mean* complementarity gap G1/n_slacks, not the raw sum: the
+        # number of complementarity pairs grows with the problem size, so an
+        # absolute threshold on the sum gets ~n_slacks times stricter on larger
+        # problems and becomes unsatisfiable at scale (the per-pair gap can sit
+        # near machine precision while the sum is still far above opt_tol). The
+        # mean gap (= 10*mu here) is the standard scale-free optimality measure.
+        # The KKT residual is likewise tested relative to its initial magnitude
+        # G0, so opt_tol is a dimensionless relative tolerance for both terms.
+        converged = (G1 / n_slacks < opt_tol) or (G_new < opt_tol * G0)
         if converged:
             if not silent:
                 print("\nConverged at iteration {}.  mu={:.2e}, KKT={:.2e}".format(
